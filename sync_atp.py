@@ -1,10 +1,4 @@
-## “””
-sync_atp.py
 
-Incremental daily sync of Sackmann tennis_atp data into Supabase.
-Only inserts matches newer than the most recent match already in the DB.
-Run via GitHub Actions or manually.
-“””
 
 import os
 import pandas as pd

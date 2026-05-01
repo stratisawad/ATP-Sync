@@ -1,0 +1,29 @@
+Read this and execute Steps 1-8 sequentially.
+
+SUPABASE CREDENTIALS are in .env file.
+
+GITHUB REPO: https://github.com/stratisawad/ATP-Sync
+
+STEP 1 - RESET SUPABASE SCHEMA
+Drop all existing tables and recreate with these exact tables: players, tournaments, matches, match_stats, elo_ratings, odds, model_predictions, rankings. Add UNIQUE constraint on players.name and tournaments.name. Add elo_ratings table with columns: elo_id, player_id, surface (Hard/Clay/Grass/Overall), elo (default 1500), matches_played, updated_date.
+
+STEP 2 - DATA LOADING
+Write and run load_data.py that: clones JeffSackmann/tennis_atp, loads 2015-2024 matches/players/tournaments/stats into Supabase, downloads odds from tennis-data.co.uk/YEAR/YEAR.xlsx for 2015-2024, loads Bet365 and Pinnacle closing odds. Use pagination (1000 rows max per query, loop until exhausted). Batch inserts at 200 rows. Use dotenv for credentials.
+
+STEP 3 - ELO CALCULATION
+Write and run compute_elo.py that computes rolling Elo for every player after every match ordered by date. Track 4 separate Elo ratings: Overall, Hard, Clay, Grass. Start at 1500. K-factor: 32 Challenger, 40 ATP250/500, 50 Masters/GrandSlam. Save historical Elo snapshots to elo_history.csv (match_id, player_id, elo_overall_before, elo_surface_before, surface, match_date). Store final ratings in elo_ratings table.
+
+STEP 4 - FEATURE ENGINEERING
+Write build_features.py that builds a feature matrix with NO data leakage (all features computed before each match). Features per player (take difference p1-p2): elo_overall, elo_surface, atp_rank, surface_win_rate_1y, recent_form_10, serve_rating (90d rolling), return_rating (90d rolling), serve_vs_return, ace_rate, bp_save_rate, days_rest, matches_last_14d, h2h_overall, h2h_surface. Match features: surface (onehot), court_speed_index, tier (onehot), round_numeric, best_of. Save to features.csv.
+
+STEP 5 - MODEL TRAINING
+Write train_model.py that: splits chronologically (train 2015-2022, validate 2023, test 2024), trains soft-voting ensemble (Logistic Regression + XGBoost + Random Forest), applies Platt scaling for calibration, evaluates accuracy/brier/logloss, saves model as atp_model.pkl.
+
+STEP 6 - BACKTESTING
+Write backtest.py that: joins 2024 predictions with Pinnacle closing odds, computes edge = model_prob - pinnacle_implied, simulates flat stake betting on edge > 0.03, reports total bets/win rate/ROI/CLV/monthly PnL/edge by surface and tier, saves backtest_results.csv.
+
+STEP 7 - DAILY SYNC
+Rewrite sync_atp.py with clean ASCII quotes only (no smart quotes). Incremental logic: check latest match_date in DB, load only newer data. After loading new matches recompute Elo for new matches only. Commit and push to GitHub. Confirm GitHub Action runs successfully.
+
+STEP 8 - PREDICTION INTERFACE
+Write predict.py that takes two player names and surface as input, computes all features, runs trained model, outputs win probability for each player and what odds would represent value. Example: python predict.py "Novak Djokovic" "Carlos Alcaraz" "Clay"

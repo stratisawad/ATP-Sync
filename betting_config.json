@@ -1,11 +1,21 @@
 {
-  "edge_min": 0.05,
+  "edge_min": 0.06,
   "edge_min_favorite": 0.07,
   "favorite_odds_cutoff": 1.5,
-  "min_odds": 1.8,
-  "max_odds": 3.0,
-  "kelly_fraction": 0.5,
+  "min_odds": 2.25,
+  "max_odds": 3.75,
+  "kelly_fraction": 1.0,
   "max_stake_units": 5.0,
-  "allowed_surfaces": ["Hard"],
-  "allowed_tiers": ["Masters 1000", "ATP 500"]
+  "allowed_surfaces": [
+    "Grass",
+    "Hard"
+  ],
+  "allowed_tiers": [
+    "ATP 250",
+    "Masters 1000"
+  ],
+  "staking": "flat",
+  "_optimized_roi": 40.02,
+  "_optimized_bets": 51,
+  "_optimized_sharpe": 2.113
 }

@@ -18,9 +18,10 @@ from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
 FEATURE_COLS = [
     "d_elo_overall", "d_elo_surface", "d_atp_rank",
     "d_surface_win_rate", "d_recent_form_10",
-    "d_serve_rating", "d_return_rating", "d_ace_rate", "d_bp_save_rate",
-    "d_days_rest", "d_matches_last_14d",
-    "h2h_overall", "h2h_surface",
+    "d_serve_rating", "d_return_rating", "serve_vs_return",
+    "d_ace_rate", "d_bp_save_rate",
+    "d_days_rest", "d_matches_last_14d", "p1_matches_14d", "p2_matches_14d",
+    "h2h_overall", "h2h_surface", "h2h_surface_3y",
     "court_speed_index", "round_numeric", "best_of", "tier_numeric",
     "surface_Hard", "surface_Clay", "surface_Grass",
     "tier_Grand_Slam", "tier_Masters_1000", "tier_ATP_500",

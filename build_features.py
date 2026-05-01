@@ -239,18 +239,27 @@ for idx, m in enumerate(matches_raw):
     l_rank = get_rank_before(l_id, match_date)
 
     # H2H
-    key_ab = (min(w_id, l_id), max(w_id, l_id))
-    h2h    = h2h_state[key_ab]
+    key_ab   = (min(w_id, l_id), max(w_id, l_id))
+    h2h      = h2h_state[key_ab]
+    three_yr = (datetime.strptime(match_date, "%Y-%m-%d") - timedelta(days=365 * 3)).strftime("%Y-%m-%d")
+
     h2h_overall_w = sum(1 for (pid, _) in h2h["overall"] if pid == w_id)
     h2h_overall_l = sum(1 for (pid, _) in h2h["overall"] if pid == l_id)
     h2h_total     = h2h_overall_w + h2h_overall_l
     h2h_overall   = (h2h_overall_w / h2h_total) if h2h_total > 0 else 0.5
 
-    surf_h2h = h2h["surface"].get(surface, [])
-    h2h_s_w  = sum(1 for (pid, _) in surf_h2h if pid == w_id)
-    h2h_s_l  = sum(1 for (pid, _) in surf_h2h if pid == l_id)
-    h2h_s_t  = h2h_s_w + h2h_s_l
-    h2h_surf = (h2h_s_w / h2h_s_t) if h2h_s_t > 0 else 0.5
+    surf_h2h  = h2h["surface"].get(surface, [])
+    h2h_s_w   = sum(1 for (pid, _) in surf_h2h if pid == w_id)
+    h2h_s_l   = sum(1 for (pid, _) in surf_h2h if pid == l_id)
+    h2h_s_t   = h2h_s_w + h2h_s_l
+    h2h_surf  = (h2h_s_w / h2h_s_t) if h2h_s_t > 0 else 0.5
+
+    # H2H on same surface — last 3 years only
+    surf_h2h_3y = [(pid, d) for (pid, d) in surf_h2h if d >= three_yr]
+    h2h_3y_w    = sum(1 for (pid, _) in surf_h2h_3y if pid == w_id)
+    h2h_3y_l    = sum(1 for (pid, _) in surf_h2h_3y if pid == l_id)
+    h2h_3y_t    = h2h_3y_w + h2h_3y_l
+    h2h_surf_3y = (h2h_3y_w / h2h_3y_t) if h2h_3y_t > 0 else 0.5
 
     def diff(a, b, default=0.0):
         if a is None and b is None:
@@ -277,27 +286,40 @@ for idx, m in enumerate(matches_raw):
     # Generate both perspectives so the model has 50/50 positive/negative labels.
     # P1=winner, target=1 and P1=loser, target=0 — differences simply flip sign.
     for p1_is_winner in (True, False):
-        p1f, p2f   = (w_feats, l_feats) if p1_is_winner else (l_feats, w_feats)
+        p1f, p2f     = (w_feats, l_feats) if p1_is_winner else (l_feats, w_feats)
         p1_rank, p2_rank = (w_rank, l_rank) if p1_is_winner else (l_rank, w_rank)
-        h2h_p1 = h2h_overall if p1_is_winner else (1 - h2h_overall)
-        h2h_p1s = h2h_surf   if p1_is_winner else (1 - h2h_surf)
+        h2h_p1       = h2h_overall  if p1_is_winner else (1 - h2h_overall)
+        h2h_p1s      = h2h_surf     if p1_is_winner else (1 - h2h_surf)
+        h2h_p1s_3y   = h2h_surf_3y  if p1_is_winner else (1 - h2h_surf_3y)
+
+        # Serve-vs-return matchup: P1's serve power against P2's return ability.
+        # Positive = P1 serve dominates P2 return; captures court dynamics better
+        # than simple serve or return differences alone.
+        def _safe(v, fallback=50.0):
+            return v if v is not None else fallback
+
+        serve_vs_return = _safe(p1f["serve_rating"]) - _safe(p2f["return_rating"])
 
         row = {**context,
-            "p1_is_winner":      int(p1_is_winner),
-            "d_elo_overall":     diff(p1f["elo_overall"], p2f["elo_overall"]),
-            "d_elo_surface":     diff(p1f["elo_surface"], p2f["elo_surface"]),
-            "d_atp_rank":        diff(p2_rank, p1_rank),  # lower rank = better
-            "d_surface_win_rate": diff(p1f["surface_win_rate"], p2f["surface_win_rate"]),
-            "d_recent_form_10":  diff(p1f["recent_form_10"], p2f["recent_form_10"]),
-            "d_serve_rating":    diff(p1f["serve_rating"], p2f["serve_rating"]),
-            "d_return_rating":   diff(p1f["return_rating"], p2f["return_rating"]),
-            "d_ace_rate":        diff(p1f["ace_rate"], p2f["ace_rate"]),
-            "d_bp_save_rate":    diff(p1f["bp_save_rate"], p2f["bp_save_rate"]),
-            "d_days_rest":       diff(p1f["days_rest"], p2f["days_rest"]),
-            "d_matches_last_14d": diff(p1f["matches_last_14d"], p2f["matches_last_14d"]),
-            "h2h_overall":       h2h_p1,
-            "h2h_surface":       h2h_p1s,
-            "winner_won":        int(p1_is_winner),
+            "p1_is_winner":        int(p1_is_winner),
+            "d_elo_overall":       diff(p1f["elo_overall"], p2f["elo_overall"]),
+            "d_elo_surface":       diff(p1f["elo_surface"], p2f["elo_surface"]),
+            "d_atp_rank":          diff(p2_rank, p1_rank),  # lower rank = better
+            "d_surface_win_rate":  diff(p1f["surface_win_rate"], p2f["surface_win_rate"]),
+            "d_recent_form_10":    diff(p1f["recent_form_10"], p2f["recent_form_10"]),
+            "d_serve_rating":      diff(p1f["serve_rating"], p2f["serve_rating"]),
+            "d_return_rating":     diff(p1f["return_rating"], p2f["return_rating"]),
+            "serve_vs_return":     serve_vs_return,           # NEW: P1 serve - P2 return
+            "d_ace_rate":          diff(p1f["ace_rate"], p2f["ace_rate"]),
+            "d_bp_save_rate":      diff(p1f["bp_save_rate"], p2f["bp_save_rate"]),
+            "d_days_rest":         diff(p1f["days_rest"], p2f["days_rest"]),
+            "d_matches_last_14d":  diff(p1f["matches_last_14d"], p2f["matches_last_14d"]),
+            "p1_matches_14d":      p1f["matches_last_14d"] or 0,  # NEW: absolute fatigue P1
+            "p2_matches_14d":      p2f["matches_last_14d"] or 0,  # NEW: absolute fatigue P2
+            "h2h_overall":         h2h_p1,
+            "h2h_surface":         h2h_p1s,
+            "h2h_surface_3y":      h2h_p1s_3y,               # NEW: 3-year surface H2H
+            "winner_won":          int(p1_is_winner),
         }
         feature_rows.append(row)
 

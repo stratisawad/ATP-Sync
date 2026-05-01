@@ -1,14 +1,28 @@
 """
 Standalone script to load odds and rankings into Supabase.
 Matches and stats are already loaded — this only does odds + rankings.
+
+Two key matching fixes vs the original:
+1. FUZZY NAME MATCHING: tennis-data.co.uk uses "Last F." while Sackmann uses
+   "First Last". We convert all DB names to "Last F." format and use rapidfuzz
+   to handle spelling variants (accents, hyphens, apostrophes, multi-part names).
+
+2. DATE-RANGE MATCH LOOKUP: Sackmann stores tournament-start dates, not actual
+   match dates. tennis-data.co.uk has actual dates. We match when the actual
+   date falls within [tourney_start, tourney_start + 14 days].
 """
 import os
+import re
+import unicodedata
 from collections import defaultdict
+from datetime import datetime, timedelta
+
 import pandas as pd
 import requests
 from io import BytesIO
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from rapidfuzz import process as fz_process, fuzz
 
 load_dotenv()
 
@@ -17,6 +31,7 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 DATA_DIR     = "./tennis_atp"
 BATCH_SIZE   = 200
 YEARS        = list(range(2015, 2025))
+FUZZY_CUTOFF = 85   # minimum similarity score (0-100) to accept a fuzzy match
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -49,11 +64,43 @@ def paginate_all(table, select, order=None):
     return rows
 
 
+def batch_upsert(table, rows, on_conflict):
+    if not rows:
+        return
+    seen, deduped = set(), []
+    for r in rows:
+        key = tuple(r[k] for k in on_conflict.split(","))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
+    for i in range(0, len(deduped), BATCH_SIZE):
+        supabase.table(table).upsert(deduped[i:i + BATCH_SIZE], on_conflict=on_conflict).execute()
+
+
 def batch_insert(table, rows):
     if not rows:
         return
     for i in range(0, len(rows), BATCH_SIZE):
         supabase.table(table).insert(rows[i:i + BATCH_SIZE]).execute()
+
+
+def normalize(s: str) -> str:
+    """Lowercase, strip accents, remove punctuation for comparison."""
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = re.sub(r"[^a-z0-9 ]", "", s.lower())
+    return s.strip()
+
+
+def to_short(fullname: str) -> str:
+    """Convert 'First [Middle] Last' → 'Last F.' matching tennis-data format."""
+    parts = fullname.strip().split()
+    if len(parts) == 1:
+        return parts[0]
+    # First token = first name, rest = last name (handles "Alex De Minaur" → "De Minaur A.")
+    first_initial = parts[0][0].upper() + "."
+    last = " ".join(parts[1:])
+    return f"{last} {first_initial}"
 
 
 # ── Load player map ───────────────────────────────────────────────────────────
@@ -62,50 +109,83 @@ all_players = paginate_all("players", "player_id,name")
 player_map  = {r["name"]: r["player_id"] for r in all_players}
 print(f"  {len(player_map)} players")
 
-# Build last-name index for "Last F." -> player_id matching
-lastname_index: dict = defaultdict(list)
+# Build two lookup structures:
+# 1. short_to_pid: "De Minaur A." -> player_id  (for exact/near-exact lookup)
+# 2. norm_short_list: [(normalized_short, player_id)] for rapidfuzz
+short_to_pid: dict[str, int]  = {}
+norm_short_list: list[tuple]  = []   # (normalized_short, player_id, original_short)
+
 for fullname, pid in player_map.items():
-    parts = fullname.strip().split()
-    if parts:
-        lastname_index[parts[-1].lower()].append((pid, fullname))
+    short = to_short(fullname)
+    short_to_pid[short] = pid
+    norm_short_list.append((normalize(short), pid, short))
+
+norm_short_keys = [x[0] for x in norm_short_list]  # for rapidfuzz choices
 
 
 def resolve_player(odds_name: str):
     odds_name = odds_name.strip()
-    if not odds_name:
+    if not odds_name or odds_name == "nan":
         return None
-    parts = odds_name.split()
-    if not parts:
-        return None
-    last = parts[0].rstrip(".").lower()
-    candidates = lastname_index.get(last, [])
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return candidates[0][0]
-    if len(parts) > 1:
-        initial = parts[1].replace(".", "").lower()
-        for pid, fullname in candidates:
-            fname_parts = fullname.strip().split()
-            if fname_parts and fname_parts[0].lower().startswith(initial):
-                return pid
-    return candidates[0][0]
+
+    # 1. Exact match on "Last F." form
+    if odds_name in short_to_pid:
+        return short_to_pid[odds_name]
+
+    # 2. Exact match after normalization
+    norm_odds = normalize(odds_name)
+    for norm, pid, _ in norm_short_list:
+        if norm == norm_odds:
+            return pid
+
+    # 3. rapidfuzz fuzzy match on normalized form
+    result = fz_process.extractOne(
+        norm_odds, norm_short_keys,
+        scorer=fuzz.token_sort_ratio,
+        score_cutoff=FUZZY_CUTOFF,
+    )
+    if result:
+        idx = norm_short_keys.index(result[0])
+        return norm_short_list[idx][1]
+
+    return None
 
 
-# ── Load match lookup ─────────────────────────────────────────────────────────
+# ── Load match lookup: (winner_id, loser_id) → [(match_id, tourney_start)] ───
+# Sackmann tourney_date = Monday tournament start, not actual match date.
+# tennis-data.co.uk has actual dates. We accept when:
+#   tourney_start <= actual_date <= tourney_start + 14
 print("Loading matches from DB ...")
 all_matches = paginate_all("matches", "match_id,match_date,winner_id,loser_id")
-match_lookup = {}
+match_lookup_by_pair: dict[tuple, list] = defaultdict(list)
 for m in all_matches:
-    key = (m["match_date"], m["winner_id"], m["loser_id"])
-    match_lookup[key] = m["match_id"]
-print(f"  {len(match_lookup)} matches in lookup")
+    if m["winner_id"] and m["loser_id"] and m["match_date"]:
+        key = (m["winner_id"], m["loser_id"])
+        match_lookup_by_pair[key].append((m["match_id"], m["match_date"]))
+print(f"  {len(all_matches)} matches, {len(match_lookup_by_pair)} unique pairs")
+
+
+def find_match(w_id: int, l_id: int, actual_date_str: str):
+    candidates = match_lookup_by_pair.get((w_id, l_id), [])
+    if not candidates:
+        return None
+    actual_dt = datetime.strptime(actual_date_str, "%Y-%m-%d")
+    for match_id, tourney_start in candidates:
+        start_dt = datetime.strptime(tourney_start, "%Y-%m-%d")
+        if timedelta(0) <= (actual_dt - start_dt) <= timedelta(days=14):
+            return match_id
+    return None
 
 
 # ── Odds ──────────────────────────────────────────────────────────────────────
-print("\nDownloading odds from tennis-data.co.uk ...")
+print("\nDownloading odds ...")
 odds_rows = []
-for year in YEARS:
+
+import sys
+test_year = int(sys.argv[1]) if len(sys.argv) > 1 else None
+years_to_run = [test_year] if test_year else YEARS
+
+for year in years_to_run:
     url = f"http://www.tennis-data.co.uk/{year}/{year}.xlsx"
     try:
         resp = requests.get(url, timeout=30)
@@ -116,7 +196,8 @@ for year in YEARS:
         continue
 
     odf["Date"] = pd.to_datetime(odf["Date"], errors="coerce")
-    matched = 0
+    matched = name_miss = date_miss = 0
+
     for _, row in odf.iterrows():
         raw_date = row.get("Date")
         if pd.isna(raw_date):
@@ -126,10 +207,12 @@ for year in YEARS:
         w_id = resolve_player(str(row.get("Winner", "")))
         l_id = resolve_player(str(row.get("Loser",  "")))
         if not w_id or not l_id:
+            name_miss += 1
             continue
 
-        match_id = match_lookup.get((date_str, w_id, l_id))
+        match_id = find_match(w_id, l_id, date_str)
         if not match_id:
+            date_miss += 1
             continue
 
         matched += 1
@@ -150,68 +233,78 @@ for year in YEARS:
                 "closing_odds": round(odds_val, 4),
                 "implied_prob": round(1.0 / odds_val, 4),
             })
-    print(f"  {year}: {len(odf)} rows, {matched} linked")
 
-print(f"\nInserting {len(odds_rows)} odds rows ...")
-batch_insert("odds", odds_rows)
-print(f"Done. {len(odds_rows)} odds rows loaded.")
+    total = matched + name_miss + date_miss
+    print(f"  {year}: {total} rows  matched={matched}  name_miss={name_miss}  date_miss={date_miss}  "
+          f"match_rate={matched/total*100:.1f}%")
 
+print(f"\nTotal odds rows to insert: {len(odds_rows)}")
 
-# ── Rankings ──────────────────────────────────────────────────────────────────
-print("\nLoading rankings ...")
-RANKING_FILES = [
-    os.path.join(DATA_DIR, "atp_rankings_10s.csv"),
-    os.path.join(DATA_DIR, "atp_rankings_20s.csv"),
-    os.path.join(DATA_DIR, "atp_rankings_current.csv"),
-]
-ranking_frames = []
-for path in RANKING_FILES:
-    if os.path.exists(path):
-        rdf = pd.read_csv(path, header=None,
-                          names=["rank_date", "atp_rank", "player_sackmann_id", "atp_points"],
-                          low_memory=False)
-        rdf = rdf[rdf["rank_date"] != "ranking_date"]
-        ranking_frames.append(rdf)
-        print(f"  {os.path.basename(path)}: {len(rdf)} rows")
-
-if not ranking_frames:
-    print("No ranking files found.")
+# If test run, don't wipe and reload all years — just upsert what we got
+if test_year:
+    print(f"Test mode: upserting {year} odds only (will deduplicate on match_id+bookmaker+player_id) ...")
+    # Delete existing odds for matches from this year first
+    print("  Clearing existing odds for this year's matches ...")
+    year_match_ids = [
+        m["match_id"] for m in all_matches
+        if m.get("match_date", "")[:4] == str(test_year)
+    ]
+    for i in range(0, len(year_match_ids), 200):
+        chunk = year_match_ids[i:i+200]
+        if chunk:
+            supabase.table("odds").delete().in_("match_id", chunk).execute()
+    batch_insert("odds", odds_rows)
+    print(f"  Done. {len(odds_rows)} odds rows for {test_year}.")
 else:
-    rdf_all = pd.concat(ranking_frames, ignore_index=True)
+    print("Inserting all odds rows ...")
+    batch_insert("odds", odds_rows)
+    print(f"Done. {len(odds_rows)} total odds rows loaded.")
 
-    # Filter to 2015+ only to keep volume manageable
-    rdf_all["rank_date"] = rdf_all["rank_date"].astype(str)
-    rdf_all = rdf_all[rdf_all["rank_date"].str[:4] >= "2015"]
-    print(f"  {len(rdf_all)} rows after filtering to 2015+")
 
-    # Load Sackmann player ID -> full name mapping
-    # atp_players.csv has header: player_id,name_first,name_last,hand,dob,ioc,height,wikidata_id
-    players_path = os.path.join(DATA_DIR, "atp_players.csv")
-    pdf = pd.read_csv(players_path, low_memory=False)
-    pdf["full_name"] = (pdf["name_first"].fillna("") + " " + pdf["name_last"].fillna("")).str.strip()
-    sid_to_name = dict(zip(pdf["player_id"].astype(str), pdf["full_name"]))
+# ── Rankings (skipped in test mode) ──────────────────────────────────────────
+if not test_year:
+    print("\nLoading rankings ...")
+    RANKING_FILES = [
+        os.path.join(DATA_DIR, "atp_rankings_10s.csv"),
+        os.path.join(DATA_DIR, "atp_rankings_20s.csv"),
+        os.path.join(DATA_DIR, "atp_rankings_current.csv"),
+    ]
+    ranking_frames = []
+    for path in RANKING_FILES:
+        if os.path.exists(path):
+            rdf = pd.read_csv(path, header=None,
+                              names=["rank_date", "atp_rank", "player_sackmann_id", "atp_points"],
+                              low_memory=False)
+            rdf = rdf[rdf["rank_date"] != "ranking_date"]
+            ranking_frames.append(rdf)
+            print(f"  {os.path.basename(path)}: {len(rdf)} rows")
 
-    rdf_all["player_sackmann_id"] = rdf_all["player_sackmann_id"].astype(str)
-    rdf_all["full_name"] = rdf_all["player_sackmann_id"].map(sid_to_name)
-    rdf_all["player_id"] = rdf_all["full_name"].map(player_map)
-    rdf_all = rdf_all.dropna(subset=["player_id"])
+    if ranking_frames:
+        rdf_all = pd.concat(ranking_frames, ignore_index=True)
+        rdf_all["rank_date"] = rdf_all["rank_date"].astype(str)
+        rdf_all = rdf_all[rdf_all["rank_date"].str[:4] >= "2015"]
 
-    rdf_all["rank_date_fmt"] = rdf_all["rank_date"].apply(
-        lambda x: f"{x[:4]}-{x[4:6]}-{x[6:]}" if len(str(x)) == 8 else None
-    )
-    rdf_all = rdf_all.dropna(subset=["rank_date_fmt"])
+        players_path = os.path.join(DATA_DIR, "atp_players.csv")
+        pdf = pd.read_csv(players_path, low_memory=False)
+        pdf["full_name"] = (pdf["name_first"].fillna("") + " " + pdf["name_last"].fillna("")).str.strip()
+        sid_to_name = dict(zip(pdf["player_id"].astype(str), pdf["full_name"]))
 
-    rank_rows = []
-    for _, r in rdf_all.iterrows():
-        rank_rows.append({
-            "player_id":  int(r["player_id"]),
-            "rank_date":  r["rank_date_fmt"],
-            "atp_rank":   si(r["atp_rank"]),
-            "atp_points": si(r["atp_points"]),
-        })
+        rdf_all["player_sackmann_id"] = rdf_all["player_sackmann_id"].astype(str)
+        rdf_all["full_name"] = rdf_all["player_sackmann_id"].map(sid_to_name)
+        rdf_all["player_id"] = rdf_all["full_name"].map(player_map)
+        rdf_all = rdf_all.dropna(subset=["player_id"])
+        rdf_all["rank_date_fmt"] = rdf_all["rank_date"].apply(
+            lambda x: f"{x[:4]}-{x[4:6]}-{x[6:]}" if len(str(x)) == 8 else None
+        )
+        rdf_all = rdf_all.dropna(subset=["rank_date_fmt"])
 
-    print(f"  Inserting {len(rank_rows)} ranking rows ...")
-    batch_insert("rankings", rank_rows)
-    print(f"  Done. {len(rank_rows)} ranking rows loaded.")
+        rank_rows = [
+            {"player_id": int(r["player_id"]), "rank_date": r["rank_date_fmt"],
+             "atp_rank": si(r["atp_rank"]), "atp_points": si(r["atp_points"])}
+            for _, r in rdf_all.iterrows()
+        ]
+        print(f"  Inserting {len(rank_rows)} ranking rows ...")
+        batch_insert("rankings", rank_rows)
+        print(f"  Done.")
 
 print("\nload_odds_rankings.py complete.")

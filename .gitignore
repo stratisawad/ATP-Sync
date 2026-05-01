@@ -3,6 +3,4 @@ venv/
 tennis_atp/
 __pycache__/
 *.pyc
-*.pkl
-*.csv
 *.xlsx

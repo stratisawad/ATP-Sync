@@ -1,12 +1,14 @@
 """
-predict.py - given two player names and a surface, outputs win probabilities
-and value odds for each player.
+predict.py - given two player names and a surface, outputs win probabilities,
+fair odds, and Kelly-sized stake recommendations based on betting_config.json.
 
 Usage:
-    python predict.py "Novak Djokovic" "Carlos Alcaraz" "Clay"
+    python predict.py "Novak Djokovic" "Carlos Alcaraz" "Hard"
+    python predict.py "Novak Djokovic" "Carlos Alcaraz" "Hard" --market 1.95 2.10
 """
 import sys
 import os
+import json
 import csv
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -21,6 +23,21 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ── Load betting config ───────────────────────────────────────────────────────
+_cfg_path = os.path.join(os.path.dirname(__file__), "betting_config.json")
+with open(_cfg_path) as _f:
+    BETTING_CFG = json.load(_f)
+
+EDGE_MIN          = BETTING_CFG["edge_min"]
+EDGE_MIN_FAV      = BETTING_CFG["edge_min_favorite"]
+FAV_CUTOFF        = BETTING_CFG["favorite_odds_cutoff"]
+MIN_ODDS          = BETTING_CFG["min_odds"]
+MAX_ODDS          = BETTING_CFG["max_odds"]
+KELLY_FRACTION    = BETTING_CFG["kelly_fraction"]
+MAX_STAKE         = BETTING_CFG["max_stake_units"]
+ALLOWED_SURFACES  = set(BETTING_CFG["allowed_surfaces"])
+ALLOWED_TIERS     = set(BETTING_CFG["allowed_tiers"])
 
 SURFACES_ONEHOT = ["Hard", "Clay", "Grass"]
 TIERS_ONEHOT    = ["Grand Slam", "Masters 1000", "ATP 500", "ATP 250", "Challenger"]
@@ -170,15 +187,63 @@ def compute_features_for_player(player_id, surface):
     }
 
 
+def kelly_stake(model_prob, closing_odds, kelly_fraction, max_stake):
+    """Half-Kelly stake in units. Returns 0 if not positive."""
+    net = closing_odds - 1.0
+    if net <= 0:
+        return 0.0
+    implied = 1.0 / closing_odds
+    edge    = model_prob - implied
+    if edge <= 0:
+        return 0.0
+    return min(kelly_fraction * edge / net, max_stake)
+
+
+def bet_verdict(model_prob, closing_odds, surface, tier):
+    """Return (qualifies, edge, stake, reason) based on betting_config.json."""
+    implied  = 1.0 / closing_odds if closing_odds > 0 else 1.0
+    edge     = model_prob - implied
+    edge_bar = EDGE_MIN_FAV if closing_odds < FAV_CUTOFF else EDGE_MIN
+
+    reasons = []
+    if surface not in ALLOWED_SURFACES:
+        reasons.append(f"surface '{surface}' not in allowed {sorted(ALLOWED_SURFACES)}")
+    if tier not in ALLOWED_TIERS:
+        reasons.append(f"tier '{tier}' not in allowed {sorted(ALLOWED_TIERS)}")
+    if not (MIN_ODDS <= closing_odds <= MAX_ODDS):
+        reasons.append(f"odds {closing_odds:.2f} outside [{MIN_ODDS}, {MAX_ODDS}]")
+    if edge <= edge_bar:
+        reasons.append(f"edge {edge*100:.1f}% <= {edge_bar*100:.0f}% threshold")
+
+    if reasons:
+        return False, edge, 0.0, "; ".join(reasons)
+
+    stake = kelly_stake(model_prob, closing_odds, KELLY_FRACTION, MAX_STAKE)
+    return True, edge, stake, "all filters passed"
+
+
 def main():
     if len(sys.argv) < 4:
-        print("Usage: python predict.py <Player1> <Player2> <Surface>")
-        print('Example: python predict.py "Novak Djokovic" "Carlos Alcaraz" "Clay"')
+        print("Usage: python predict.py <Player1> <Player2> <Surface> [--tier <tier>] [--market <p1_odds> <p2_odds>]")
+        print('Example: python predict.py "Novak Djokovic" "Carlos Alcaraz" "Hard" --tier "Masters 1000" --market 1.95 2.10')
         sys.exit(1)
 
     p1_name = sys.argv[1].strip()
     p2_name = sys.argv[2].strip()
     surface = sys.argv[3].strip().capitalize()
+
+    # Optional args
+    tier         = "Masters 1000"   # default
+    market_odds  = None             # (p1_odds, p2_odds) if provided
+
+    i = 4
+    while i < len(sys.argv):
+        if sys.argv[i] == "--tier" and i + 1 < len(sys.argv):
+            tier = sys.argv[i + 1]; i += 2
+        elif sys.argv[i] == "--market" and i + 2 < len(sys.argv):
+            market_odds = (float(sys.argv[i + 1]), float(sys.argv[i + 2])); i += 3
+        else:
+            i += 1
 
     if surface not in ("Hard", "Clay", "Grass"):
         print(f"Surface must be Hard, Clay, or Grass. Got: {surface}")
@@ -189,17 +254,15 @@ def main():
     r2 = supabase.table("players").select("player_id,name").ilike("name", f"%{p2_name}%").execute()
 
     if not r1.data:
-        print(f"Player not found: {p1_name}")
-        sys.exit(1)
+        print(f"Player not found: {p1_name}"); sys.exit(1)
     if not r2.data:
-        print(f"Player not found: {p2_name}")
-        sys.exit(1)
+        print(f"Player not found: {p2_name}"); sys.exit(1)
 
     p1 = r1.data[0]
     p2 = r2.data[0]
     print(f"  P1: {p1['name']} (id={p1['player_id']})")
     print(f"  P2: {p2['name']} (id={p2['player_id']})")
-    print(f"  Surface: {surface}")
+    print(f"  Surface: {surface}  |  Tier: {tier}")
 
     print("\nComputing features ...")
     f1 = compute_features_for_player(p1["player_id"], surface)
@@ -210,6 +273,9 @@ def main():
         b = b if b is not None else default
         return a - b
 
+    def _s(v, fb=50.0):
+        return v if v is not None else fb
+
     feature_vec = {
         "d_elo_overall":      diff(f1["elo_overall"], f2["elo_overall"]),
         "d_elo_surface":      diff(f1["elo_surface"], f2["elo_surface"]),
@@ -218,50 +284,81 @@ def main():
         "d_recent_form_10":   diff(f1["recent_form_10"], f2["recent_form_10"]),
         "d_serve_rating":     diff(f1["serve_rating"], f2["serve_rating"]),
         "d_return_rating":    diff(f1["return_rating"], f2["return_rating"]),
+        "serve_vs_return":    _s(f1["serve_rating"]) - _s(f2["return_rating"]),
         "d_ace_rate":         diff(f1["ace_rate"], f2["ace_rate"]),
         "d_bp_save_rate":     diff(f1["bp_save_rate"], f2["bp_save_rate"]),
         "d_days_rest":        0.0,
         "d_matches_last_14d": 0.0,
+        "p1_matches_14d":     0.0,
+        "p2_matches_14d":     0.0,
         "h2h_overall":        0.5,
         "h2h_surface":        0.5,
+        "h2h_surface_3y":     0.5,
         "court_speed_index":  CSI_MAP.get(surface, 42.0),
-        "round_numeric":      6,   # assume SF as default
+        "round_numeric":      6,
         "best_of":            3,
-        "tier_numeric":       3,   # assume ATP 500 default
+        "tier_numeric":       TIER_MAP.get(tier, 3),
     }
 
     for s in SURFACES_ONEHOT:
         feature_vec[f"surface_{s}"] = 1 if surface == s else 0
     for t in TIERS_ONEHOT:
-        feature_vec[f"tier_{t.replace(' ', '_')}"] = 0
+        feature_vec[f"tier_{t.replace(' ', '_')}"] = 1 if tier == t else 0
 
     print("Loading model ...")
-    payload       = joblib.load("./atp_model.pkl")
-    model         = payload["model"]
-    feature_cols  = payload["feature_cols"]
-    medians       = payload["medians"]
+    payload      = joblib.load("./atp_model.pkl")
+    model        = payload["model"]
+    feature_cols = payload["feature_cols"]
+    medians      = payload["medians"]
 
     X = np.array([[feature_vec.get(c, medians.get(c, 0.0)) for c in feature_cols]])
 
-    prob_p1 = float(model.predict_proba(X)[0, 1])
-    prob_p2 = 1.0 - prob_p1
-
+    prob_p1      = float(model.predict_proba(X)[0, 1])
+    prob_p2      = 1.0 - prob_p1
     fair_odds_p1 = round(1.0 / prob_p1, 3) if prob_p1 > 0 else None
     fair_odds_p2 = round(1.0 / prob_p2, 3) if prob_p2 > 0 else None
 
-    print(f"\n{'='*55}")
-    print(f"  {p1['name']:<28}  {prob_p1*100:5.1f}%  fair odds: {fair_odds_p1}")
-    print(f"  {p2['name']:<28}  {prob_p2*100:5.1f}%  fair odds: {fair_odds_p2}")
-    print(f"{'='*55}")
-    print(f"\n  Value betting guide:")
-    print(f"  Bet {p1['name']} if market odds > {fair_odds_p1}")
-    print(f"  Bet {p2['name']} if market odds > {fair_odds_p2}")
+    # ── Output ────────────────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"  {p1['name']:<30}  {prob_p1*100:5.1f}%   fair odds: {fair_odds_p1}")
+    print(f"  {p2['name']:<30}  {prob_p2*100:5.1f}%   fair odds: {fair_odds_p2}")
+    print(f"{'='*60}")
 
-    print(f"\n  Key features ({p1['name']} vs {p2['name']}):")
-    print(f"    Elo overall diff:   {feature_vec['d_elo_overall']:+.1f}")
-    print(f"    Elo {surface} diff: {feature_vec['d_elo_surface']:+.1f}")
+    print(f"\n  Key features:")
+    print(f"    Elo overall diff:    {feature_vec['d_elo_overall']:+.1f}  (P1 - P2)")
+    print(f"    Elo {surface:<5} diff:    {feature_vec['d_elo_surface']:+.1f}")
+    print(f"    Serve vs return:     {feature_vec['serve_vs_return']:+.1f}")
     if f1["rank"] and f2["rank"]:
-        print(f"    ATP rank:           {p1['name']} #{f1['rank']} vs {p2['name']} #{f2['rank']}")
+        print(f"    ATP rank:            #{f1['rank']} vs #{f2['rank']}")
+
+    # ── Betting verdict ───────────────────────────────────────────────────────
+    print(f"\n  Betting assessment  (config: {os.path.basename(_cfg_path)})")
+    print(f"  {'─'*56}")
+
+    if market_odds:
+        for player, prob, mkt_odds in [
+            (p1["name"], prob_p1, market_odds[0]),
+            (p2["name"], prob_p2, market_odds[1]),
+        ]:
+            qualifies, edge, stake, reason = bet_verdict(prob, mkt_odds, surface, tier)
+            implied = 1.0 / mkt_odds
+            symbol  = "BET" if qualifies else "PASS"
+            print(f"\n  [{symbol}] {player}")
+            print(f"         Market odds: {mkt_odds:.3f}  implied: {implied*100:.1f}%")
+            print(f"         Model prob:  {prob*100:.1f}%   edge: {edge*100:+.1f}%")
+            if qualifies:
+                print(f"         Half-Kelly stake: {stake:.3f} units")
+            else:
+                print(f"         Reason: {reason}")
+    else:
+        print(f"\n  No market odds provided. Pass --market <p1_odds> <p2_odds> for a bet verdict.")
+        print(f"  Config requires: surface in {sorted(ALLOWED_SURFACES)}, "
+              f"tier in {sorted(ALLOWED_TIERS)}, odds [{MIN_ODDS}–{MAX_ODDS}], edge >{EDGE_MIN*100:.0f}%")
+        print(f"\n  Minimum odds to bet each player (at {EDGE_MIN*100:.0f}% edge):")
+        min_mkt_p1 = round(fair_odds_p1 * (1 + EDGE_MIN / (1 - EDGE_MIN)), 3) if fair_odds_p1 else None
+        min_mkt_p2 = round(fair_odds_p2 * (1 + EDGE_MIN / (1 - EDGE_MIN)), 3) if fair_odds_p2 else None
+        print(f"    Bet {p1['name']:<28} if market >= {min_mkt_p1}")
+        print(f"    Bet {p2['name']:<28} if market >= {min_mkt_p2}")
 
 
 if __name__ == "__main__":

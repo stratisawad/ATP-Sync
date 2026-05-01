@@ -1,0 +1,11 @@
+{
+  "edge_min": 0.05,
+  "edge_min_favorite": 0.07,
+  "favorite_odds_cutoff": 1.5,
+  "min_odds": 1.8,
+  "max_odds": 3.0,
+  "kelly_fraction": 0.5,
+  "max_stake_units": 5.0,
+  "allowed_surfaces": ["Hard"],
+  "allowed_tiers": ["Masters 1000", "ATP 500"]
+}

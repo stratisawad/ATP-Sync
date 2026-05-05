@@ -19,29 +19,23 @@ Credentials in .env:
 import os
 import re
 import json
-import smtplib
 import joblib
 import requests
 import unicodedata
 import numpy as np
 from datetime import date, datetime, timedelta
 from collections import defaultdict
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from rapidfuzz import process as fz_process, fuzz
 
 load_dotenv()
 
-SUPABASE_URL   = os.environ["SUPABASE_URL"]
-SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
-ODDS_API_KEY   = os.environ.get("ODDS_API_KEY", "")
-EMAIL_FROM     = os.environ.get("EMAIL_FROM", "")
-EMAIL_TO       = os.environ.get("EMAIL_TO", "")
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
-SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT      = int(os.environ.get("SMTP_PORT", "587"))
+SUPABASE_URL    = os.environ["SUPABASE_URL"]
+SUPABASE_KEY    = os.environ["SUPABASE_KEY"]
+ODDS_API_KEY    = os.environ.get("ODDS_API_KEY", "")
+TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 WINNER_EDGE_THR  = 0.04   # 4%
 HANDICAP_EDGE_THR = 0.03  # 3%
@@ -351,7 +345,7 @@ def compute_features_for_match(p1_id, p2_id, surface, csi, tier_name,
     def h2h_weighted(st, opp_id):
         history = st.h2h[opp_id][-H2H_LAST_N:]
         if not history:
-            return 0.0
+            return 0.5  # neutral prior, matches training data convention
         weights = [H2H_DECAY ** (len(history) - 1 - i) for i in range(len(history))]
         return sum(w * m["won"] for w, m in zip(weights, history)) / sum(weights)
 
@@ -531,22 +525,42 @@ def fetch_odds():
     if not ODDS_API_KEY:
         print("  WARNING: ODDS_API_KEY not set — no odds data")
         return []
-    url = (f"https://api.the-odds-api.com/v4/sports/{ODDS_API_SPORT}/odds/"
-           f"?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h&oddsFormat=decimal")
+    # Discover all active ATP tennis sport keys
     try:
-        resp = requests.get(url, timeout=20)
-        resp.raise_for_status()
-        return resp.json()
+        sports_resp = requests.get(
+            f"https://api.the-odds-api.com/v4/sports/?apiKey={ODDS_API_KEY}",
+            timeout=20,
+        )
+        sports_resp.raise_for_status()
+        atp_keys = [s["key"] for s in sports_resp.json()
+                    if s.get("key", "").startswith("tennis_atp")]
+        print(f"  Active ATP sport keys: {atp_keys}")
     except Exception as e:
-        print(f"  Odds API error: {e}")
+        print(f"  Sports list error: {e}")
         return []
+
+    all_events = []
+    for sport_key in atp_keys:
+        url = (f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
+               f"?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h&oddsFormat=decimal")
+        try:
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            events = resp.json()
+            for e in events:
+                e["_sport_key"] = sport_key   # carry through for surface inference
+            all_events.extend(events)
+        except Exception as e:
+            print(f"  Odds API error ({sport_key}): {e}")
+    return all_events
 
 
 def infer_surface_from_tournament(name):
     """Heuristic surface inference from tournament name."""
     n = normalize(name)
-    if any(w in n for w in ["clay", "roland", "monte", "madrid", "rome",
-                              "barcelona", "hamburg", "rio", "argentina"]):
+    if any(w in n for w in ["clay", "roland", "monte", "madrid", "rome", "italian",
+                              "barcelona", "hamburg", "rio", "argentina", "munich",
+                              "estoril", "bucharest", "lyon", "geneva", "parma"]):
         return "Clay"
     if any(w in n for w in ["wimbledon", "grass", "queens", "eastbourne",
                               "halle", "hertogenbosch"]):
@@ -646,25 +660,22 @@ def format_alert(p1_name, p2_name, surface, tier, match_date,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Send email
+# Send Telegram message
 # ─────────────────────────────────────────────────────────────────────────────
-def send_email(subject, body):
-    if not all([EMAIL_FROM, EMAIL_TO, EMAIL_PASSWORD]):
-        print("  Email credentials not set — skipping send")
+def send_telegram(text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("  Telegram credentials not set — skipping send")
         return False
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = EMAIL_FROM
-        msg["To"]      = EMAIL_TO
-        msg.attach(MIMEText(body, "plain"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_FROM, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        resp = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text":    text,
+        }, timeout=15)
+        resp.raise_for_status()
         return True
     except Exception as e:
-        print(f"  Email error: {e}")
+        print(f"  Telegram error: {e}")
         return False
 
 
@@ -752,10 +763,12 @@ def main():
         p1_imp = 1.0 / p1_odds
         p2_imp = 1.0 / p2_odds
 
-        # Infer tournament context from event title
+        # Infer tournament context — use both sport_title and sport_key for clues
         sport_title = event.get("sport_title", "")
-        surface  = infer_surface_from_tournament(sport_title)
-        tier     = infer_tier(sport_title)
+        sport_key   = event.get("_sport_key", sport_title)
+        infer_str   = sport_key + " " + sport_title   # combine for better matching
+        surface  = infer_surface_from_tournament(infer_str)
+        tier     = infer_tier(infer_str)
         csi      = CSI_DEFAULT.get(surface, 42.0)
 
         # Try to match tournament in DB for better context
@@ -824,12 +837,10 @@ def main():
         print(f"\n{'─'*60}")
         print(alert_text)
 
-        # Email
-        subject = (f"ATP Alert [{alert_type.upper()}]: {home} vs {away} "
-                   f"— edge {abs(winner_edge)*100:.1f}%")
-        sent = send_email(subject, alert_text)
+        # Telegram
+        sent = send_telegram(alert_text)
         if sent:
-            print(f"  Email sent to {EMAIL_TO}")
+            print(f"  Telegram message sent")
 
         # Log to DB
         log_alert(
